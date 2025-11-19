@@ -1,0 +1,8 @@
+<h1>Your Profile</h1>
+<p>Logged in as: {{ username }}</p>
+
+<form action="/profile/update" method="post">
+    <input type="hidden" name="owner_id" value="{{ user_id }}">
+    <input type="text" name="bio" placeholder="Update bio">
+    <button type="submit">Save</button>
+</form>

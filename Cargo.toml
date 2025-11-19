@@ -1,8 +1,8 @@
 [package]
 name = "ProjectFrontend"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
-rocket = "0.5.1"
-
+rocket = { version = "0.5.0", features = ["json"] }
+rocket_dyn_templates = { version = "0.1.0", features = ["handlebars"] }
