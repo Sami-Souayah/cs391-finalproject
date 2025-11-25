@@ -1,4 +1,7 @@
+use std::env;
 use mongodb::{options::ClientOptions, Client, Database};
+use dotenvy::dotenv;
+
 
 pub struct MongoRepo {
     pub db: Database,
@@ -6,7 +9,10 @@ pub struct MongoRepo {
 
 impl MongoRepo {
     pub async fn init() -> Self {
-        let mut opts = ClientOptions::parse("mongodb://localhost:27017")
+        dotenv().ok();
+        let mongo_uri = env::var("MONGO_URI")
+
+        let mut opts = ClientOptions::parse(&mongo_uri)
             .await
             .expect("Failed to parse DB URL");
 
