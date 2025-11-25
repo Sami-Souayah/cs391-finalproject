@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>
+        {{#if title}}
+            {{title}}
+        {{else}}
+            My App
+        {{/if}}
+    </title>
+
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<nav>
+    <a href="/">Login</a> |
+    <a href="/dashboard">Dashboard</a> |
+    <a href="/submit">Submit Data</a>
+</nav>
+
+<hr>
+
+<div class="content">
+    {{{ content }}}
+</div>
+
+</body>
+</html>

@@ -1,28 +1,28 @@
 #[macro_use] extern crate rocket;
-use rocket::form::Form;
 use rocket_dyn_templates::Template;
-
-#[derive(FromForm)]
-struct InputForm {
-    username: String,
-}
+use std::collections::HashMap;
 
 #[get("/")]
-fn index() -> Template {
-    Template::render("index", &())
+fn login_page() -> Template {
+    Template::render("login", ())
 }
 
-
-
-#[post("/submit", data = "<form_data>")]
-fn submit(form_data: Form<InputForm>) -> String {
-    format!("You entered: {}", form_data.username)
+#[get("/dashboard")]
+fn dashboard_page() -> Template {
+    let mut ctx = HashMap::new();
+    ctx.insert("username", "test_user");
+    ctx.insert("data", "None submitted yet");
+    Template::render("dashboard", &ctx)
 }
 
+#[get("/submit")]
+fn submit_page() -> Template {
+    Template::render("submit", ())
+}
 
 #[launch]
 fn rocket() -> _ {
     rocket::build()
-        .mount("/", routes![index, submit])
+        .mount("/", routes![login_page, dashboard_page, submit_page])
         .attach(Template::fairing())
 }
