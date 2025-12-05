@@ -33,7 +33,7 @@ struct SubmitForm {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct User {
     pub username: String,
-    pub data: Option<String>,  // encrypted string
+    pub data: Option<String>,  
 }
 
 #[get("/")]
