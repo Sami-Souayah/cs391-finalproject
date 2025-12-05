@@ -3,20 +3,22 @@ extern crate rocket;
 
 use rocket::form::Form;
 use rocket::response::Redirect;
-use rocket::http::{Cookie, CookieJar};
+use rocket::http::CookieJar;
 use rocket_dyn_templates::Template;
 
 use std::collections::HashMap;
-
 use serde::{Serialize, Deserialize};
 use rocket::State;
 
 use mongodb::bson::doc;
 
 mod db;
-use crate::db::MongoRepo;
+mod sessions;
+mod policies;
 
-
+use db::MongoRepo;
+use sessions::{SessionManager};
+use policies::{reject_sensitive_text, user_may_access};
 
 #[derive(FromForm)]
 struct LoginForm {
@@ -31,10 +33,8 @@ struct SubmitForm {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct User {
     pub username: String,
-    pub data: Option<String>,
+    pub data: Option<String>,  // encrypted string
 }
-
-
 
 #[get("/")]
 fn login_page() -> Template {
@@ -45,11 +45,13 @@ fn login_page() -> Template {
 async fn handle_login(
     form: Form<LoginForm>,
     repo: &State<MongoRepo>,
+    sessions: &State<SessionManager>,
     cookies: &CookieJar<'_>,
 ) -> Redirect {
     let username = form.username.to_owned();
 
-    cookies.add(Cookie::new("username", username.clone()));
+    // Create secure session
+    sessions.create_session(cookies, &username);
 
     let users = repo.db.collection::<User>("users");
 
@@ -67,26 +69,26 @@ async fn handle_login(
     Redirect::to("/dashboard")
 }
 
-
 #[get("/dashboard")]
 async fn dashboard_page(
     repo: &State<MongoRepo>,
+    sessions: &State<SessionManager>,
     cookies: &CookieJar<'_>,
 ) -> Template {
-    let username = match cookies.get("username") {
-        Some(c) => c.value().to_string(),
-        None => return Template::render("login", ()), 
+    let session = match sessions.get_session(cookies) {
+        Some(s) => s,
+        None => return Template::render("login", ()),
     };
 
     let users = repo.db.collection::<User>("users");
 
     let user = users
-        .find_one(doc! { "username": &username }, None)
+        .find_one(doc! { "username": &session.username }, None)
         .await
         .unwrap()
         .unwrap_or(User {
-            username: username.clone(),
-            data: Some("None".to_string()),
+            username: session.username.clone(),
+            data: Some("None".into()),
         });
 
     let mut ctx = HashMap::new();
@@ -96,28 +98,34 @@ async fn dashboard_page(
     Template::render("dashboard", &ctx)
 }
 
-
-// GET /submit — Show form
 #[get("/submit")]
 fn submit_page() -> Template {
     Template::render("submit", ())
 }
 
-
 #[post("/submit", data = "<form>")]
 async fn handle_submit(
     form: Form<SubmitForm>,
     repo: &State<MongoRepo>,
+    sessions: &State<SessionManager>,
     cookies: &CookieJar<'_>,
 ) -> Redirect {
-    let username = cookies.get("username").unwrap().value().to_string();
+    let session = sessions.get_session(cookies).unwrap();
+
+    // Sensitive data validation
+    if !reject_sensitive_text(&form.text) {
+        panic!("Sensitive data detected! Rejecting.");
+    }
+
+    // Encrypt data before storing
+    let encrypted = base64::encode(&sessions.cocoon.wrap(form.text.as_bytes()).unwrap());
 
     let users = repo.db.collection::<User>("users");
 
     users
         .update_one(
-            doc! { "username": &username },
-            doc! { "$set": { "data": &form.text }},
+            doc! { "username": &session.username },
+            doc! { "$set": { "data": encrypted }},
             None,
         )
         .await
@@ -126,15 +134,14 @@ async fn handle_submit(
     Redirect::to("/dashboard")
 }
 
-
-
-
 #[launch]
 async fn rocket() -> _ {
     let repo = MongoRepo::init().await;
+    let session_mgr = SessionManager::new();
 
     rocket::build()
         .manage(repo)
+        .manage(session_mgr)
         .mount(
             "/",
             routes![
