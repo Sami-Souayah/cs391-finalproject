@@ -1,5 +1,10 @@
+// main.rs
 #[macro_use]
 extern crate rocket;
+
+mod db;
+mod sessions;
+mod policies;
 
 use rocket::form::Form;
 use rocket::response::Redirect;
@@ -9,16 +14,23 @@ use rocket_dyn_templates::Template;
 use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
 use rocket::State;
+use base64::Engine as _;
 
 use mongodb::bson::doc;
+use mongodb::options::UpdateOptions;
 
-mod db;
-mod sessions;
-mod policies;
+
 
 use db::MongoRepo;
-use sessions::{SessionManager};
-use policies::{reject_sensitive_text, user_may_access};
+use sessions::{SessionManager, SessionData};
+use policies::{reject_sensitive_text, owner_decrypt_if_allowed};
+
+#[derive(Debug, Serialize, Deserialize)]
+struct User {
+    username: String,
+    // base64-encoded ciphertext of the user's data
+    data: Option<String>,
+}
 
 #[derive(FromForm)]
 struct LoginForm {
@@ -30,118 +42,129 @@ struct SubmitForm {
     text: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct User {
-    pub username: String,
-    pub data: Option<String>,  
-}
+// ---------- Routes ----------
 
-#[get("/")]
+#[get("/login")]
 fn login_page() -> Template {
-    Template::render("login", ())
+    Template::render("login", &HashMap::<String, String>::new())
 }
 
 #[post("/login", data = "<form>")]
 async fn handle_login(
     form: Form<LoginForm>,
-    repo: &State<MongoRepo>,
-    sessions: &State<SessionManager>,
     cookies: &CookieJar<'_>,
+    sessions: &State<SessionManager>,
+    repo: &State<MongoRepo>,
 ) -> Redirect {
-    let username = form.username.to_owned();
+    let username = form.username.trim().to_string();
+    if username.is_empty() {
+        return Redirect::to("/login");
+    }
 
-    // Create secure session
-    sessions.create_session(cookies, &username);
+    let session = SessionData { username: username.clone() };
+    sessions.set_session_cookie(cookies, &session);
 
     let users = repo.db.collection::<User>("users");
+    let filter = doc! { "username": &username };
+    let update = doc! { "$setOnInsert": { "username": &username } };
+    let options = mongodb::options::UpdateOptions::builder().upsert(true).build();
 
-    users
-        .update_one(
-            doc! { "username": &username },
-            doc! { "$setOnInsert": { "data": "" }},
-            mongodb::options::UpdateOptions::builder()
-                .upsert(true)
-                .build(),
-        )
-        .await
-        .unwrap();
+    // OLD: users.update_one(...).await;
+    let _ = users.update_one(filter, update, options);
 
     Redirect::to("/dashboard")
 }
 
 #[get("/dashboard")]
 async fn dashboard_page(
-    repo: &State<MongoRepo>,
-    sessions: &State<SessionManager>,
     cookies: &CookieJar<'_>,
-) -> Template {
-    let session = match sessions.get_session(cookies) {
+    sessions: &State<SessionManager>,
+    repo: &State<MongoRepo>,
+) -> Result<Template, Redirect> {
+    let session = match sessions.get_session_from_cookies(cookies) {
         Some(s) => s,
-        None => return Template::render("login", ()),
+        None => return Err(Redirect::to("/login")),
     };
 
     let users = repo.db.collection::<User>("users");
 
     let user = users
         .find_one(doc! { "username": &session.username }, None)
-        .await
-        .unwrap()
-        .unwrap_or(User {
-            username: session.username.clone(),
-            data: Some("None".into()),
-        });
+        .ok()
+        .flatten();
+    let data_display = if let Some(user) = user {
+        if let Some(enc) = user.data {
+            match owner_decrypt_if_allowed(&sessions, &session, &enc) {
+                Ok(plain) => plain,
+                Err(_) => "[policy violation: cannot decrypt]".to_string(),
+            }
+        } else {
+            "(no data submitted yet)".to_string()
+        }
+    } else {
+        "(no user document found)".to_string()
+    };
 
     let mut ctx = HashMap::new();
-    ctx.insert("username", user.username);
-    ctx.insert("data", user.data.unwrap_or("None".to_string()));
+    ctx.insert("username".to_string(), session.username.clone());
+    ctx.insert("data".to_string(), data_display);
 
-    Template::render("dashboard", &ctx)
+    Ok(Template::render("dashboard", &ctx))
 }
 
 #[get("/submit")]
 fn submit_page() -> Template {
-    Template::render("submit", ())
+    Template::render("submit", &HashMap::<String, String>::new())
 }
 
 #[post("/submit", data = "<form>")]
 async fn handle_submit(
     form: Form<SubmitForm>,
-    repo: &State<MongoRepo>,
-    sessions: &State<SessionManager>,
     cookies: &CookieJar<'_>,
+    sessions: &State<SessionManager>,
+    repo: &State<MongoRepo>,
 ) -> Redirect {
-    let session = sessions.get_session(cookies).unwrap();
+    let session = match sessions.get_session_from_cookies(cookies) {
+        Some(s) => s,
+        None => return Redirect::to("/login"),
+    };
 
-    // Sensitive data validation
-    if !reject_sensitive_text(&form.text) {
-        panic!("Sensitive data detected! Rejecting.");
+    let text = form.text.trim().to_string();
+    if text.is_empty() {
+        return Redirect::to("/submit");
     }
 
-    // Encrypt data before storing
-    let encrypted = base64::encode(&sessions.cocoon.wrap(form.text.as_bytes()).unwrap());
+    if !reject_sensitive_text(&text) {
+        return Redirect::to("/submit?error=policy");
+    }
+
+    let encrypted_bytes = match sessions.encrypt_for_session(&session, text.as_bytes()) {
+        Some(b) => b,
+        None => return Redirect::to("/submit?error=encrypt"),
+    };
+
+    let encrypted_b64 =
+        base64::engine::general_purpose::STANDARD.encode(encrypted_bytes);
 
     let users = repo.db.collection::<User>("users");
-
-    users
-        .update_one(
-            doc! { "username": &session.username },
-            doc! { "$set": { "data": encrypted }},
-            None,
-        )
-        .await
-        .unwrap();
+    let _ = users.update_one(
+        doc! { "username": &session.username },
+        doc! { "$set": { "data": encrypted_b64 } },
+        None,
+    );
 
     Redirect::to("/dashboard")
 }
 
+
 #[launch]
-async fn rocket() -> _ {
-    let repo = MongoRepo::init().await;
-    let session_mgr = SessionManager::new();
+fn rocket() -> _ {
+    let repo = MongoRepo::init();
+    let session_manager = SessionManager::new();
 
     rocket::build()
         .manage(repo)
-        .manage(session_mgr)
+        .manage(session_manager)
         .mount(
             "/",
             routes![
