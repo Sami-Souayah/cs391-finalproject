@@ -16,8 +16,7 @@ pub struct SessionManager {
 
 impl SessionManager {
     pub fn new() -> Self {
-        // For a real app, you'd load this from env; for demo,
-        // we generate a fresh key each run.
+       
         let key = Aes256Gcm::generate_key(&mut OsRng);
         SessionManager { key }
     }
@@ -45,7 +44,6 @@ impl SessionManager {
         cipher.decrypt(nonce, ct).ok()
     }
 
-    /// Create an authenticated session cookie (Policy 3).
     pub fn create_session(&self, cookies: &CookieJar<'_>, username: &str) {
         let session = SessionData {
             username: username.to_owned(),
@@ -57,14 +55,13 @@ impl SessionManager {
 
             let cookie = Cookie::build(("session", encoded))
                 .path("/")
-                .http_only(true)
-                .finish();
+                .http_only(true);
+
 
             cookies.add(cookie);
         }
     }
 
-    /// Read / decrypt the current session, if any.
     pub fn get_session(&self, cookies: &CookieJar<'_>) -> Option<SessionData> {
         let cookie = cookies.get("session")?;
         let decoded = general_purpose::STANDARD.decode(cookie.value()).ok()?;
@@ -72,7 +69,6 @@ impl SessionManager {
         serde_json::from_slice(&decrypted).ok()
     }
 
-    /// Encrypt arbitrary data "for this session".
     pub fn encrypt_for_session(
         &self,
         _session: &SessionData,
@@ -81,7 +77,6 @@ impl SessionManager {
         self.encrypt_bytes(plaintext)
     }
 
-    /// Decrypt arbitrary data "for this session".
     pub fn decrypt_for_session(
         &self,
         _session: &SessionData,

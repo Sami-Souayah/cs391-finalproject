@@ -38,7 +38,6 @@ pub struct User {
     pub data: Option<String>,
 }
 
-// For submit template context
 #[derive(Serialize)]
 struct SubmitContext {
     policy_error: bool,
@@ -62,10 +61,8 @@ async fn handle_login(
         return Redirect::to("/");
     }
 
-    // Policy 3: create an authenticated session token
     sessions.create_session(cookies, &username);
 
-    // Ensure user exists in DB
     let users = repo.db.collection::<User>("users");
     users
         .update_one(
@@ -87,7 +84,6 @@ async fn dashboard_page(
     sessions: &State<SessionManager>,
     cookies: &CookieJar<'_>,
 ) -> DashboardResult {
-    // Policy 3: must be authenticated to view dashboard
     let session = match sessions.get_session(cookies) {
         Some(s) => s,
         None => return Err(Redirect::to("/")),
@@ -100,7 +96,6 @@ async fn dashboard_page(
         .expect("db error");
 
     let (username, data_display) = if let Some(user) = user_opt {
-        // Decrypt user data if it exists, applying Policy 1.
         let data_display = match user.data {
             Some(enc_b64) if !enc_b64.is_empty() => {
                 match owner_decrypt_if_allowed(&sessions, &session, &enc_b64) {
@@ -139,7 +134,6 @@ async fn handle_submit(
     sessions: &State<SessionManager>,
     cookies: &CookieJar<'_>,
 ) -> Redirect {
-    // Policy 3: must be authenticated to submit
     let session = match sessions.get_session(cookies) {
         Some(s) => s,
         None => return Redirect::to("/"),
@@ -148,19 +142,15 @@ async fn handle_submit(
         return Redirect::to("/");
     }
 
-    // Policy 2: reject sensitive inputs
     if !reject_sensitive_text(&form.text) {
         return Redirect::to("/submit?error=sensitive");
     }
 
-    // Policy 1: only owner can update their own data.
-    // (Here target is just the currently logged-in user,
-    // but this shows how you'd guard against trying to write someone else’s doc.)
+
     if !user_may_access(&session, &session.username) {
         return Redirect::to("/submit?error=not_allowed");
     }
 
-    // Encrypt and store
     let encrypted_bytes = match sessions.encrypt_for_session(&session, form.text.as_bytes()) {
         Some(b) => b,
         None => return Redirect::to("/submit?error=encrypt"),
