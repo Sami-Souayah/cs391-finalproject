@@ -1,4 +1,4 @@
-// main.rs
+// src/main.rs
 #[macro_use]
 extern crate rocket;
 
@@ -6,29 +6,21 @@ mod db;
 mod sessions;
 mod policies;
 
+use std::collections::HashMap;
+
 use rocket::form::Form;
 use rocket::response::Redirect;
 use rocket::http::CookieJar;
-use rocket_dyn_templates::Template;
-
-use std::collections::HashMap;
-use serde::{Serialize, Deserialize};
 use rocket::State;
-use base64::Engine as _;
+use rocket_dyn_templates::Template;
+use serde::{Deserialize, Serialize};
 
 use mongodb::bson::doc;
-
-
+use base64::{engine::general_purpose, Engine as _};
 
 use db::MongoRepo;
-use sessions::{SessionManager, SessionData};
-use policies::{reject_sensitive_text, owner_decrypt_if_allowed};
-
-#[derive(Debug, Serialize, Deserialize)]
-struct User {
-    username: String,
-    data: Option<String>,
-}
+use sessions::{SessionManager};
+use policies::{reject_sensitive_text, user_may_access, owner_decrypt_if_allowed, require_authenticated};
 
 #[derive(FromForm)]
 struct LoginForm {
@@ -40,142 +32,154 @@ struct SubmitForm {
     text: String,
 }
 
-#[derive(FromForm)]
-struct SubmitQuery {
-    error: Option<String>,
+#[derive(Debug, Serialize, Deserialize)]
+pub struct User {
+    pub username: String,
+    pub data: Option<String>,
 }
 
+// For submit template context
+#[derive(Serialize)]
+struct SubmitContext {
+    policy_error: bool,
+    encrypt_error: bool,
+}
 
 #[get("/")]
-fn index() -> Redirect {
-    Redirect::to("/login")
-}
-
-
-#[get("/login")]
 fn login_page() -> Template {
-    Template::render("login", &HashMap::<String, String>::new())
+    Template::render("login", ())
 }
 
 #[post("/login", data = "<form>")]
 async fn handle_login(
     form: Form<LoginForm>,
-    cookies: &CookieJar<'_>,
-    sessions: &State<SessionManager>,
     repo: &State<MongoRepo>,
+    sessions: &State<SessionManager>,
+    cookies: &CookieJar<'_>,
 ) -> Redirect {
     let username = form.username.trim().to_string();
     if username.is_empty() {
-        return Redirect::to("/login");
+        return Redirect::to("/");
     }
 
-    let session = SessionData { username: username.clone() };
-    sessions.set_session_cookie(cookies, &session);
+    // Policy 3: create an authenticated session token
+    sessions.create_session(cookies, &username);
 
+    // Ensure user exists in DB
     let users = repo.db.collection::<User>("users");
-    let filter = doc! { "username": &username };
-    let update = doc! { "$setOnInsert": { "username": &username } };
-    let options = mongodb::options::UpdateOptions::builder().upsert(true).build();
-
-    let _ = users.update_one(filter, update, options);
+    users
+        .update_one(
+            doc! { "username": &username },
+            doc! { "$setOnInsert": { "username": &username, "data": "" } },
+            mongodb::options::UpdateOptions::builder().upsert(true).build(),
+        )
+        .await
+        .expect("failed to upsert user");
 
     Redirect::to("/dashboard")
 }
 
+type DashboardResult = Result<Template, Redirect>;
+
 #[get("/dashboard")]
 async fn dashboard_page(
-    cookies: &CookieJar<'_>,
-    sessions: &State<SessionManager>,
     repo: &State<MongoRepo>,
-) -> Result<Template, Redirect> {
-    let session = match sessions.get_session_from_cookies(cookies) {
+    sessions: &State<SessionManager>,
+    cookies: &CookieJar<'_>,
+) -> DashboardResult {
+    // Policy 3: must be authenticated to view dashboard
+    let session = match sessions.get_session(cookies) {
         Some(s) => s,
-        None => return Err(Redirect::to("/login")),
+        None => return Err(Redirect::to("/")),
     };
 
     let users = repo.db.collection::<User>("users");
-
-    let user = users
+    let user_opt = users
         .find_one(doc! { "username": &session.username }, None)
-        .ok()
-        .flatten();
-    let data_display = if let Some(user) = user {
-        if let Some(enc) = user.data {
-            match owner_decrypt_if_allowed(&sessions, &session, &enc) {
-                Ok(plain) => plain,
-                Err(_) => "[policy violation: cannot decrypt]".to_string(),
+        .await
+        .expect("db error");
+
+    let (username, data_display) = if let Some(user) = user_opt {
+        // Decrypt user data if it exists, applying Policy 1.
+        let data_display = match user.data {
+            Some(enc_b64) if !enc_b64.is_empty() => {
+                match owner_decrypt_if_allowed(&sessions, &session, &enc_b64) {
+                    Ok(plain) => plain,
+                    Err(msg) => format!("[policy violation: {}]", msg),
+                }
             }
-        } else {
-            "(no data submitted yet)".to_string()
-        }
+            _ => "(no data stored yet)".to_string(),
+        };
+
+        (user.username, data_display)
     } else {
-        "(no user document found)".to_string()
+        (session.username.clone(), "(no user document found)".to_string())
     };
 
     let mut ctx = HashMap::new();
-    ctx.insert("username".to_string(), session.username.clone());
+    ctx.insert("username".to_string(), username);
     ctx.insert("data".to_string(), data_display);
 
     Ok(Template::render("dashboard", &ctx))
 }
 
-#[get("/submit?<q..>")]
-fn submit_page(q: Option<SubmitQuery>) -> Template {
-    let mut ctx: HashMap<String, String> = HashMap::new();
-
-    if let Some(query) = q {
-        if query.error.as_deref() == Some("policy") {
-            // This will be truthy in Handlebars
-            ctx.insert("policy_error".to_string(), "true".to_string());
-        }
-        if query.error.as_deref() == Some("encrypt") {
-            ctx.insert("encrypt_error".to_string(), "true".to_string());
-        }
-    }
-
+#[get("/submit?<error>")]
+fn submit_page(error: Option<String>) -> Template {
+    let ctx = SubmitContext {
+        policy_error: matches!(error.as_deref(), Some("sensitive")),
+        encrypt_error: matches!(error.as_deref(), Some("encrypt")),
+    };
     Template::render("submit", &ctx)
 }
 
 #[post("/submit", data = "<form>")]
 async fn handle_submit(
     form: Form<SubmitForm>,
-    cookies: &CookieJar<'_>,
-    sessions: &State<SessionManager>,
     repo: &State<MongoRepo>,
+    sessions: &State<SessionManager>,
+    cookies: &CookieJar<'_>,
 ) -> Redirect {
-    let session = match sessions.get_session_from_cookies(cookies) {
+    // Policy 3: must be authenticated to submit
+    let session = match sessions.get_session(cookies) {
         Some(s) => s,
-        None => return Redirect::to("/login"),
+        None => return Redirect::to("/"),
     };
-
-    let text = form.text.trim().to_string();
-    if text.is_empty() {
-        return Redirect::to("/submit");
+    if !require_authenticated(Some(&session)) {
+        return Redirect::to("/");
     }
 
-    if !reject_sensitive_text(&text) {
-
-        return Redirect::to("/submit?error=policy");
+    // Policy 2: reject sensitive inputs
+    if !reject_sensitive_text(&form.text) {
+        return Redirect::to("/submit?error=sensitive");
     }
 
-    let encrypted_bytes = match sessions.encrypt_for_session(&session, text.as_bytes()) {
+    // Policy 1: only owner can update their own data.
+    // (Here target is just the currently logged-in user,
+    // but this shows how you'd guard against trying to write someone else’s doc.)
+    if !user_may_access(&session, &session.username) {
+        return Redirect::to("/submit?error=not_allowed");
+    }
+
+    // Encrypt and store
+    let encrypted_bytes = match sessions.encrypt_for_session(&session, form.text.as_bytes()) {
         Some(b) => b,
         None => return Redirect::to("/submit?error=encrypt"),
     };
 
-    let encrypted_b64 =
-        base64::engine::general_purpose::STANDARD.encode(encrypted_bytes);
+    let encrypted_b64 = general_purpose::STANDARD.encode(encrypted_bytes);
 
     let users = repo.db.collection::<User>("users");
-    let _ = users.update_one(
-        doc! { "username": &session.username },
-        doc! { "$set": { "data": encrypted_b64 } },
-        None,
-    );
+    users
+        .update_one(
+            doc! { "username": &session.username },
+            doc! { "$set": { "data": encrypted_b64 } },
+            None,
+        )
+        .await
+        .expect("failed to update user");
 
     Redirect::to("/dashboard")
 }
-
 
 #[launch]
 fn rocket() -> _ {
@@ -188,7 +192,6 @@ fn rocket() -> _ {
         .mount(
             "/",
             routes![
-                index,
                 login_page,
                 handle_login,
                 dashboard_page,

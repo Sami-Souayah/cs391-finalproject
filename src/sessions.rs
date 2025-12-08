@@ -1,11 +1,8 @@
-// sessions.rs
 use rocket::http::{Cookie, CookieJar};
-use serde::{Serialize, Deserialize};
-use aes_gcm::{
-    Aes256Gcm,
-    aead::{Aead, KeyInit, OsRng, AeadCore},
-    Nonce, 
-};
+use serde::{Deserialize, Serialize};
+
+use aes_gcm::{Aes256Gcm, Nonce};
+use aes_gcm::aead::{Aead, KeyInit, OsRng, AeadCore};
 use base64::{engine::general_purpose, Engine as _};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,67 +15,79 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
-    // Generate a fresh random key at startup
     pub fn new() -> Self {
+        // For a real app, you'd load this from env; for demo,
+        // we generate a fresh key each run.
         let key = Aes256Gcm::generate_key(&mut OsRng);
         SessionManager { key }
     }
 
-    // Encrypt plaintext; prefix nonce to ciphertext so we can decrypt later
-fn encrypt_raw(&self, plaintext: &[u8]) -> Option<Vec<u8>> {
-    let cipher = Aes256Gcm::new(&self.key);
+    fn cipher(&self) -> Aes256Gcm {
+        Aes256Gcm::new(&self.key)
+    }
 
-    // This now works because AeadCore is in scope
-    let nonce = Aes256Gcm::generate_nonce(&mut OsRng); // 96 bits
+    fn encrypt_bytes(&self, plaintext: &[u8]) -> Option<Vec<u8>> {
+        let cipher = self.cipher();
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng); 
+        let mut out = nonce.to_vec(); 
+        let mut ct = cipher.encrypt(&nonce, plaintext).ok()?;
+        out.append(&mut ct);
+        Some(out)
+    }
 
-    let mut out = nonce.to_vec();
-    match cipher.encrypt(&nonce, plaintext) {
-        Ok(mut ct) => {
-            out.append(&mut ct);
-            Some(out)
+    fn decrypt_bytes(&self, data: &[u8]) -> Option<Vec<u8>> {
+        if data.len() < 12 {
+            return None;
         }
-        Err(_) => None,
-    }
-}
-
-
-fn decrypt_raw(&self, data: &[u8]) -> Option<Vec<u8>> {
-    if data.len() < 12 {
-        return None;
+        let (nonce_bytes, ct) = data.split_at(12);
+        let nonce = Nonce::from_slice(nonce_bytes);
+        let cipher = self.cipher();
+        cipher.decrypt(nonce, ct).ok()
     }
 
-    let cipher = Aes256Gcm::new(&self.key);
-    let (nonce_bytes, ct) = data.split_at(12);
+    /// Create an authenticated session cookie (Policy 3).
+    pub fn create_session(&self, cookies: &CookieJar<'_>, username: &str) {
+        let session = SessionData {
+            username: username.to_owned(),
+        };
 
-    let nonce = Nonce::from_slice(nonce_bytes);
+        let json = serde_json::to_vec(&session).expect("serialize session");
+        if let Some(encrypted) = self.encrypt_bytes(&json) {
+            let encoded = general_purpose::STANDARD.encode(encrypted);
 
-    cipher.decrypt(nonce, ct).ok()
-}
+            let cookie = Cookie::build(("session", encoded))
+                .path("/")
+                .http_only(true)
+                .finish();
 
-
-
-    pub fn set_session_cookie(&self, cookies: &CookieJar<'_>, session: &SessionData) {
-        let json = serde_json::to_string(session).expect("serialize session");
-        if let Some(cipher_bytes) = self.encrypt_raw(json.as_bytes()) {
-            let value = general_purpose::STANDARD.encode(cipher_bytes);
-            cookies.add(Cookie::new("session", value));
+            cookies.add(cookie);
         }
     }
 
-    pub fn get_session_from_cookies(&self, cookies: &CookieJar<'_>) -> Option<SessionData> {
+    /// Read / decrypt the current session, if any.
+    pub fn get_session(&self, cookies: &CookieJar<'_>) -> Option<SessionData> {
         let cookie = cookies.get("session")?;
-        let bytes = general_purpose::STANDARD.decode(cookie.value()).ok()?;
-        let plain = self.decrypt_raw(&bytes)?;
-        serde_json::from_slice(&plain).ok()
+        let decoded = general_purpose::STANDARD.decode(cookie.value()).ok()?;
+        let decrypted = self.decrypt_bytes(&decoded)?;
+        serde_json::from_slice(&decrypted).ok()
     }
 
-    /// High-level API for app code
-    pub fn encrypt_for_session(&self, _session: &SessionData, plaintext: &[u8]) -> Option<Vec<u8>> {
-        self.encrypt_raw(plaintext)
+    /// Encrypt arbitrary data "for this session".
+    pub fn encrypt_for_session(
+        &self,
+        _session: &SessionData,
+        plaintext: &[u8],
+    ) -> Option<Vec<u8>> {
+        self.encrypt_bytes(plaintext)
     }
 
-    pub fn decrypt_for_session(&self, _session: &SessionData, cipher_bytes: &[u8]) -> Option<String> {
-        self.decrypt_raw(cipher_bytes)
-            .and_then(|b| String::from_utf8(b).ok())
+    /// Decrypt arbitrary data "for this session".
+    pub fn decrypt_for_session(
+        &self,
+        _session: &SessionData,
+        ciphertext: &[u8],
+    ) -> Option<String> {
+        let bytes = self.decrypt_bytes(ciphertext)?;
+        String::from_utf8(bytes).ok()
     }
 }
