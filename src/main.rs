@@ -17,7 +17,6 @@ use rocket::State;
 use base64::Engine as _;
 
 use mongodb::bson::doc;
-use mongodb::options::UpdateOptions;
 
 
 
@@ -28,7 +27,6 @@ use policies::{reject_sensitive_text, owner_decrypt_if_allowed};
 #[derive(Debug, Serialize, Deserialize)]
 struct User {
     username: String,
-    // base64-encoded ciphertext of the user's data
     data: Option<String>,
 }
 
@@ -42,7 +40,17 @@ struct SubmitForm {
     text: String,
 }
 
-// ---------- Routes ----------
+#[derive(FromForm)]
+struct SubmitQuery {
+    error: Option<String>,
+}
+
+
+#[get("/")]
+fn index() -> Redirect {
+    Redirect::to("/login")
+}
+
 
 #[get("/login")]
 fn login_page() -> Template {
@@ -69,7 +77,6 @@ async fn handle_login(
     let update = doc! { "$setOnInsert": { "username": &username } };
     let options = mongodb::options::UpdateOptions::builder().upsert(true).build();
 
-    // OLD: users.update_one(...).await;
     let _ = users.update_one(filter, update, options);
 
     Redirect::to("/dashboard")
@@ -112,9 +119,21 @@ async fn dashboard_page(
     Ok(Template::render("dashboard", &ctx))
 }
 
-#[get("/submit")]
-fn submit_page() -> Template {
-    Template::render("submit", &HashMap::<String, String>::new())
+#[get("/submit?<q..>")]
+fn submit_page(q: Option<SubmitQuery>) -> Template {
+    let mut ctx: HashMap<String, String> = HashMap::new();
+
+    if let Some(query) = q {
+        if query.error.as_deref() == Some("policy") {
+            // This will be truthy in Handlebars
+            ctx.insert("policy_error".to_string(), "true".to_string());
+        }
+        if query.error.as_deref() == Some("encrypt") {
+            ctx.insert("encrypt_error".to_string(), "true".to_string());
+        }
+    }
+
+    Template::render("submit", &ctx)
 }
 
 #[post("/submit", data = "<form>")]
@@ -135,6 +154,7 @@ async fn handle_submit(
     }
 
     if !reject_sensitive_text(&text) {
+
         return Redirect::to("/submit?error=policy");
     }
 
@@ -168,6 +188,7 @@ fn rocket() -> _ {
         .mount(
             "/",
             routes![
+                index,
                 login_page,
                 handle_login,
                 dashboard_page,

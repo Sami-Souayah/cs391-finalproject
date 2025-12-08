@@ -1,5 +1,16 @@
-
 <h1>Submit Data</h1>
+
+{{#if policy_error}}
+<p style="color: red; font-weight: bold;">
+    Your input violated the privacy policy. Please enter different text.
+</p>
+{{/if}}
+
+{{#if encrypt_error}}
+<p style="color: red; font-weight: bold;">
+    Something went wrong while encrypting your data. Please try again.
+</p>
+{{/if}}
 
 <form method="post" action="/submit">
     <input type="text" name="text" placeholder="Enter some text">
