@@ -1,4 +1,3 @@
-// src/policies.rs
 use regex::Regex;
 use base64::{engine::general_purpose, Engine as _};
 
@@ -23,13 +22,11 @@ pub fn require_authenticated(session: Option<&SessionData>) -> bool {
     session.is_some()
 }
 
-/// High-level helper: enforce Policy 1, then decrypt.
 pub fn owner_decrypt_if_allowed(
     sessions: &SessionManager,
     session: &SessionData,
     encrypted_b64: &str,
 ) -> Result<String, &'static str> {
-    // Enforce owner-only read.
     if !user_may_access(session, &session.username) {
         return Err("not allowed to read this user's data");
     }
